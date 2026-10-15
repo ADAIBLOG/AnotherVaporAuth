@@ -47,6 +47,7 @@
   "accountsEmpty": "Noch keine Konten. Importiere ein maFile oder melde dich an, um eins hinzuzufügen.",
   "emptyAddAccount": "Konto hinzufügen",
   "accountReady": "Bereit",
+  "accountRevocationCode": "Widerrufscode: {code}",
   "tutCodeTitle": "Live-Code",
   "tutCodeBody": "Tippe auf den großen Code, um ihn zu kopieren. Tippe auf den Kontonamen, um zwischen Benutzername / Nickname / SteamID zu wechseln.",
   "tutSwipeRightTitle": "Nach rechts → Bestätigungen",
