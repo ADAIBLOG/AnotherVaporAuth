@@ -54,6 +54,14 @@
   "accountsEmpty": "No accounts yet. Import a maFile or log in to add one.",
   "emptyAddAccount": "Add account",
   "accountReady": "Ready",
+  "accountRevocationCode": "R-code: {code}",
+  "@accountRevocationCode": {
+    "placeholders": {
+      "code": {
+        "type": "String"
+      }
+    }
+  },
   "tutCodeTitle": "Live token",
   "tutCodeBody": "Tap the big code to copy it. Tap the account name to cycle username / nickname / SteamID.",
   "tutSwipeRightTitle": "Swipe right → confirmations",
