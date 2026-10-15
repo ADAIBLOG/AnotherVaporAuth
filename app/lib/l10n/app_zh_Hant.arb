@@ -47,6 +47,7 @@
   "accountsEmpty": "還沒有帳號。匯入 maFile 或登入來新增一個。",
   "emptyAddAccount": "新增帳號",
   "accountReady": "就緒",
+  "accountRevocationCode": "撤銷碼：{code}",
   "tutCodeTitle": "即時驗證碼",
   "tutCodeBody": "點大字驗證碼就能複製。點帳號那一行可在帳號名稱 / 暱稱 / SteamID 之間切換。",
   "tutSwipeRightTitle": "向右滑 → 交易確認",
