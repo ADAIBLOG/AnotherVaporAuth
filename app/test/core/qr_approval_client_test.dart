@@ -16,6 +16,7 @@ class _FakeApi extends SteamApiClient {
   final List<ProtoReader> responses;
   bool called = false;
   String? lastAccessToken;
+  ProtoWriter? lastRequest;
   _FakeApi(this.responses);
 
   @override
@@ -29,6 +30,7 @@ class _FakeApi extends SteamApiClient {
   }) async {
     called = true;
     lastAccessToken = accessToken;
+    lastRequest = request;
     return responses.removeAt(0);
   }
 }
@@ -194,6 +196,42 @@ void main() {
       expect(ok, isTrue);
       expect(api.called, isTrue);
       expect(api.lastAccessToken, 'atok');
+    });
+  });
+
+  group('respondToSession — rememberPassword maps to persistence field 6', () {
+    // Valve's ESessionPersistence (from the client's enums.proto):
+    //   k_ESessionPersistence_Ephemeral = 0 (session-only, no saved password)
+    //   k_ESessionPersistence_Persistent = 1 (remember my password)
+    // The proto declares field 6 with default=Persistent, so the field must
+    // always be written explicitly — an absent field would silently mean
+    // "remember" even when the user left the box unchecked.
+    Future<int?> persistenceOf(bool remember) async {
+      final api = _FakeApi([ProtoReader(Uint8List(0))]); // empty = success
+      final client = QrApprovalClient(api);
+      await client.respondToSession(_account(accessToken: 'atok'),
+          version: 1, clientId: 123, approve: true,
+          rememberPassword: remember);
+      return ProtoReader(api.lastRequest!.toBytes()).parse()[6]?.varint;
+    }
+
+    test('checked box → persistence 1 (k_ESessionPersistence_Persistent)',
+        () async {
+      expect(await persistenceOf(true), 1);
+    });
+
+    test('unchecked box → persistence 0 (k_ESessionPersistence_Ephemeral)',
+        () async {
+      expect(await persistenceOf(false), 0);
+    });
+
+    test('reject path also carries the explicit persistence value', () async {
+      final api = _FakeApi([ProtoReader(Uint8List(0))]);
+      final client = QrApprovalClient(api);
+      await client.respondToSession(_account(accessToken: 'atok'),
+          version: 1, clientId: 123, approve: false,
+          rememberPassword: false);
+      expect(ProtoReader(api.lastRequest!.toBytes()).parse()[6]?.varint, 0);
     });
   });
 }
