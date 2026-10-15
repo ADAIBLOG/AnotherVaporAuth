@@ -1625,6 +1625,41 @@ class _MainPanel extends ConsumerWidget {
                       ),
                     ),
                   ),
+                  // Revocation (rescue) code under the status line. Long-press
+                  // to copy, like the account name above. maFile imports may
+                  // lack the field — hide the row entirely then.
+                  if ((account.revocationCode ?? '').isNotEmpty)
+                    GestureDetector(
+                      onLongPress: () {
+                        Clipboard.setData(ClipboardData(
+                            text: account.revocationCode!.toUpperCase()));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text(l.copied)));
+                      },
+                      behavior: HitTestBehavior.opaque,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                            maxWidth: MediaQuery.sizeOf(context).width * 0.6),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.key_outlined,
+                                size: context.r(12), color: t.muted),
+                            SizedBox(width: context.r(4)),
+                            Flexible(
+                              child: Text(
+                                  l.accountRevocationCode(
+                                      account.revocationCode!.toUpperCase()),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                      color: t.muted,
+                                      fontSize: context.r(12))),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
                 ],
                 ),
               ),
