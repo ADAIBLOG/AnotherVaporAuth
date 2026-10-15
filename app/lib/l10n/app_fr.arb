@@ -47,6 +47,7 @@
   "accountsEmpty": "Aucun compte pour l'instant. Importez un maFile ou connectez-vous pour en ajouter un.",
   "emptyAddAccount": "Ajouter un compte",
   "accountReady": "Prêt",
+  "accountRevocationCode": "Code de révocation : {code}",
   "tutCodeTitle": "Code en direct",
   "tutCodeBody": "Touchez le grand code pour le copier. Touchez le nom du compte pour alterner entre nom de compte, pseudo et SteamID.",
   "tutSwipeRightTitle": "Glisser à droite → confirmations",
