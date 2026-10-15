@@ -47,6 +47,7 @@
   "accountsEmpty": "Аккаунтов пока нет. Импортируйте maFile или войдите, чтобы добавить.",
   "emptyAddAccount": "Добавить аккаунт",
   "accountReady": "Готов",
+  "accountRevocationCode": "Код отзыва: {code}",
   "tutCodeTitle": "Текущий код",
   "tutCodeBody": "Нажмите на крупный код, чтобы скопировать его. Нажмите на имя аккаунта, чтобы переключать логин / никнейм / SteamID.",
   "tutSwipeRightTitle": "Свайп вправо → подтверждения",
