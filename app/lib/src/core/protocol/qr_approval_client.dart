@@ -1,209 +1,431 @@
-import 'dart:convert';
-import 'dart:typed_data';
+import 'dart:io';
 
-import 'package:crypto/crypto.dart';
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
-import '../../services/steam_api_client.dart';
-import '../models/steam_guard_account.dart';
-import '../proto/protobuf_wire.dart';
-import 'community_session.dart';
+import '../../l10n/app_localizations.dart';
+import '../app/providers.dart';
+import '../app/responsive.dart';
+import '../app/theme.dart';
+import '../core/models/steam_guard_account.dart';
+import '../core/protocol/qr_approval_client.dart';
+import '../services/auto_login.dart';
+import 'widgets/ava_panel.dart';
+import 'widgets/scanline_overlay.dart';
+import 'error_text.dart';
 
-/// Parsed components of a Steam login QR challenge URL,
-/// e.g. `https://s.team/q/<version>/<client_id>`.
-class QrChallenge {
-  final int version;
-  final int clientId;
-  const QrChallenge(this.version, this.clientId);
+/// The approval endpoints authenticate with the access token alone, and Steam
+/// access tokens are short-lived (~24 h JWTs) — anyone scanning a QR a day
+/// after their last session refresh would fail. Renew a stale token up front
+/// via the same fallback chain as checkPendingLogins (refresh token, then
+/// headless password re-login). Returns false when no usable session could be
+/// established; callers should send the user to re-login.
+Future<bool> _ensureUsableSession(
+    WidgetRef ref, SteamGuardAccount account) async {
+  if (!AutoLogin.accessTokenStale(account.session.accessToken)) return true;
+  // Captured before the await: the renewed (possibly rotated) tokens must be
+  // persisted even if the calling widget is gone by the time it returns.
+  final controller = ref.read(appControllerProvider.notifier);
+  final outcome = await ref.read(autoLoginProvider).ensureSession(account);
+  if (outcome != AutoLoginOutcome.ok) return false;
+  // Persist the renewed tokens so the next launch skips the dance.
+  await controller.persistSession(account);
+  return true;
+}
 
-  /// Only Steam's own hosts issue login QR codes — reject anything else so a
-  /// crafted QR (e.g. `https://evil.example/q/1/123`) can't be treated as a
-  /// legitimate challenge to approve.
-  static const _allowedHosts = {
-    's.team',
-    'steamcommunity.com',
-    'www.steamcommunity.com',
-  };
-
-  /// Parses the challenge URL embedded in a login QR code.
-  static QrChallenge? tryParse(String raw) {
-    final input = raw.trim();
-    final uri = Uri.tryParse(input);
-    if (uri == null) return null;
-    if (uri.scheme != 'https' || !_allowedHosts.contains(uri.host)) {
-      return null;
-    }
-    // Path looks like /q/<version>/<client_id> (host s.team or steamcommunity).
-    final segs = uri.pathSegments;
-    final qIdx = segs.indexOf('q');
-    if (qIdx >= 0 && segs.length >= qIdx + 3) {
-      final version = int.tryParse(segs[qIdx + 1]);
-      final clientId = _parseUint64(segs[qIdx + 2]);
-      if (version != null && clientId != null) {
-        return QrChallenge(version, clientId);
-      }
-    }
-    return null;
+/// Streamlined entry for the home screen's top-right scan button: on touch
+/// devices, jump straight into the camera for [account] and confirm from a
+/// dialog showing where the sign-in comes from; desktop (no camera) falls
+/// back to the full screen with the paste field, preselected to [account].
+Future<void> quickApproveLogin(
+    BuildContext context, WidgetRef ref, SteamGuardAccount account) async {
+  final l = AppLocalizations.of(context);
+  if (!(Platform.isAndroid || Platform.isIOS)) {
+    await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => ApproveLoginScreen(initialAccount: account)));
+    return;
   }
-
-  /// Steam client ids are random uint64s, so about half of them exceed the
-  /// signed 2^63-1 ceiling of `int.tryParse` — which silently turned half of
-  /// all real login QR codes into "not a Steam QR". Parse through BigInt and
-  /// keep the two's-complement (possibly negative) int; the wire layer
-  /// (varint / HMAC little-endian) treats ints as raw 64-bit patterns.
-  static int? _parseUint64(String s) {
-    final big = BigInt.tryParse(s);
-    if (big == null || big.isNegative || big.bitLength > 64) return null;
-    return big.toSigned(64).toInt();
+  if (!account.session.hasTokens) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(l.sessionExpired)));
+    return;
+  }
+  final code = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const _ScannerPage()));
+  if (code == null || !context.mounted) return;
+  final challenge = QrChallenge.tryParse(code);
+  if (challenge == null) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(l.approveBadCode)));
+    return;
+  }
+  if (!await _ensureUsableSession(ref, account)) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(l.sessionExpired)));
+    }
+    return;
+  }
+  if (!context.mounted) return;
+  final client = QrApprovalClient(ref.read(apiClientProvider));
+  // Best-effort context (IP / location / device) for the confirm dialog —
+  // the approval itself works without it.
+  AuthSessionInfo? info;
+  try {
+    info = await client.sessionInfo(account, challenge.clientId);
+  } catch (_) {}
+  if (!context.mounted) return;
+  final decision = await _confirmApproveDialog(context, account, info);
+  if (decision == null || !context.mounted) return;
+  final (approve, remember) = decision;
+  try {
+    final ok = await client.respond(account, challenge,
+        approve: approve, rememberPassword: remember);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(ok
+            ? (approve ? l.approveSuccess : l.approveRejected)
+            : l.commonError)));
+  } catch (e) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text('${l.commonError}: ${describeError(l, e)}')));
   }
 }
 
-/// Details of a pending login session (GetAuthSessionInfo) shown to the user
-/// before they approve or deny it.
-class AuthSessionInfo {
-  final int clientId;
-  final int version;
-  final String ip;
-  final String city;
-  final String country;
-  final String deviceName;
-  const AuthSessionInfo({
-    required this.clientId,
-    required this.version,
-    required this.ip,
-    required this.city,
-    required this.country,
-    required this.deviceName,
-  });
+/// Decision returned by the approval confirm dialog: whether the login was
+/// approved and whether Steam should remember the password on the requesting
+/// device (the official app's "remember my password" checkbox).
+typedef ApproveDecision = (bool approve, bool rememberPassword);
 
-  String get location => [city, country].where((s) => s.isNotEmpty).join(', ');
+Future<ApproveDecision?> _confirmApproveDialog(BuildContext context,
+    SteamGuardAccount account, AuthSessionInfo? info) {
+  final l = AppLocalizations.of(context);
+  final t = Theme.of(context).extension<AvaTokens>()!;
+  Widget detail(String text) => Padding(
+        padding: EdgeInsets.only(top: context.r(3)),
+        child: Text(text,
+            style: TextStyle(color: t.muted, fontSize: context.r(13))),
+      );
+  var remember = false;
+  return showDialog<ApproveDecision>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setState) => AlertDialog(
+        title: Text(l.approveTitle),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(account.accountName ?? '${account.steamId}',
+                style: TextStyle(
+                    fontWeight: FontWeight.bold, fontSize: context.r(15))),
+            SizedBox(height: context.r(6)),
+            if (info != null) ...[
+              if (info.location.isNotEmpty)
+                detail('${l.approveLocation}: ${info.location}'),
+              if (info.ip.isNotEmpty) detail('IP: ${info.ip}'),
+              if (info.deviceName.isNotEmpty)
+                detail('${l.approveDevice}: ${info.deviceName}'),
+            ],
+            SizedBox(height: context.r(12)),
+            Text(l.approveWarnStranger,
+                style: TextStyle(color: t.warn, fontSize: context.r(12.5))),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              dense: true,
+              value: remember,
+              onChanged: (v) => setState(() => remember = v ?? false),
+              title: Text(l.approveRememberPassword,
+                  style: TextStyle(fontSize: context.r(13))),
+            ),
+          ],
+        ),
+        actions: [
+          OutlinedButton(
+              onPressed: () => Navigator.pop(ctx, (false, remember)),
+              child: Text(l.approveReject)),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, (true, remember)),
+              child: Text(l.approveButton)),
+        ],
+      ),
+    ),
+  );
 }
 
-/// Direction B: this app acts as the approver for a login started elsewhere —
-/// either by scanning the login QR, or by polling the account's own pending
-/// login sessions (GetAuthSessionsForAccount) so they can be approved like the
-/// official app's pop-up, without a push.
-class QrApprovalClient {
-  final SteamApiClient api;
-  QrApprovalClient(this.api);
+class ApproveLoginScreen extends ConsumerStatefulWidget {
+  /// Preselects this account in the dropdown (if it has a live session).
+  final SteamGuardAccount? initialAccount;
+  const ApproveLoginScreen({super.key, this.initialAccount});
 
-  // Every call below guards with the shared [requireAccessToken]: these
-  // endpoints authenticate with the access token alone, so fail clearly
-  // instead of sending an empty token.
+  @override
+  ConsumerState<ApproveLoginScreen> createState() =>
+      _ApproveLoginScreenState();
+}
 
-  /// Lists client ids of pending login sessions awaiting approval for [account].
-  Future<List<int>> pendingLoginClientIds(SteamGuardAccount account) async {
-    final token = requireAccessToken(account);
-    final fields = (await api.callProtobuf(
-      'IAuthenticationService',
-      'GetAuthSessionsForAccount',
-      request: ProtoWriter(),
-      accessToken: token,
-      useGet: true,
-    ))
-        .parseAll();
-    final ids = <int>[];
-    for (final f in fields) {
-      if (f.number != 1) continue;
-      if (f.varint != null) {
-        ids.add(f.varint!); // unpacked repeated uint64
-      } else if (f.bytes != null) {
-        ids.addAll(f.asPackedVarints()); // packed repeated uint64
-      }
-    }
-    return ids;
+class _ApproveLoginScreenState extends ConsumerState<ApproveLoginScreen> {
+  final _link = TextEditingController();
+  SteamGuardAccount? _account;
+  bool _busy = false;
+  String? _message;
+
+  bool get _canScan => Platform.isAndroid || Platform.isIOS;
+
+  @override
+  void dispose() {
+    _link.dispose();
+    super.dispose();
   }
 
-  /// Fetches details (IP / location / device / version) for a pending login.
-  Future<AuthSessionInfo?> sessionInfo(
-      SteamGuardAccount account, int clientId) async {
-    final token = requireAccessToken(account);
-    final req = ProtoWriter()..writeUint64(1, clientId);
-    final f = (await api.callProtobuf(
-      'IAuthenticationService',
-      'GetAuthSessionInfo',
-      request: req,
-      accessToken: token,
-    ))
-        .parse();
-    return AuthSessionInfo(
-      clientId: clientId,
-      version: f[8]?.asInt ?? 0,
-      ip: f[1]?.asString ?? '',
-      city: f[3]?.asString ?? '',
-      country: f[5]?.asString ?? '',
-      deviceName: f[7]?.asString ?? '',
+  Future<void> _scan() async {
+    final code = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const _ScannerPage()),
+    );
+    if (code != null) setState(() => _link.text = code);
+  }
+
+  Future<void> _respond(bool approve) async {
+    final l = AppLocalizations.of(context);
+    final account = _account;
+    if (account == null) return;
+    final challenge = QrChallenge.tryParse(_link.text);
+    if (challenge == null) {
+      setState(() => _message = l.commonError);
+      return;
+    }
+    setState(() => _busy = true);
+    if (!await _ensureUsableSession(ref, account)) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _message = l.sessionExpired;
+      });
+      return;
+    }
+    if (!mounted) return;
+    final client = QrApprovalClient(ref.read(apiClientProvider));
+    var finalApprove = approve;
+    var remember = false;
+    if (approve) {
+      // Anti-phishing gate: never approve blind. Pull best-effort context
+      // (IP / location / device) and make the user confirm it's really them
+      // via the same dialog the quick-scan path (quickApproveLogin above)
+      // shows, before actually sending approve:true.
+      AuthSessionInfo? info;
+      try {
+        info = await client.sessionInfo(account, challenge.clientId);
+      } catch (_) {}
+      if (!mounted) return;
+      final confirmed = await _confirmApproveDialog(context, account, info);
+      if (!mounted) return;
+      if (confirmed == null) {
+        setState(() => _busy = false);
+        return;
+      }
+      (finalApprove, remember) = confirmed;
+    }
+    try {
+      final ok = await client.respond(account, challenge,
+          approve: finalApprove, rememberPassword: remember);
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _message = ok
+            ? (finalApprove ? l.approveSuccess : l.approveRejected)
+            : l.commonError;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _message = '${l.commonError}: ${describeError(l, e)}';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context);
+    final accounts = (ref.watch(appControllerProvider).value?.visibleAccounts ??
+            const <SteamGuardAccount>[])
+        .where((a) => a.session.hasTokens)
+        .toList();
+    _account ??= accounts.contains(widget.initialAccount)
+        ? widget.initialAccount
+        : (accounts.isNotEmpty ? accounts.first : null);
+
+    final t = Theme.of(context).extension<AvaTokens>()!;
+    return Scaffold(
+      appBar: AppBar(title: Text(l.approveTitle)),
+      body: ScanlineOverlay(
+        child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420),
+          child: SingleChildScrollView(
+            padding: context.rSafeInsets(all: 24),
+            child: AvaPanel(
+              padding: context.rInsets(all: 20),
+              child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Icon(Icons.qr_code_2, size: context.r(40), color: t.accent),
+                SizedBox(height: context.r(14)),
+                if (accounts.isEmpty)
+                  Text(l.sessionExpired)
+                else
+                  DropdownButtonFormField<SteamGuardAccount>(
+                    initialValue: _account,
+                    items: accounts
+                        .map((a) => DropdownMenuItem(
+                              value: a,
+                              child: Text(a.accountName ?? '${a.steamId}'),
+                            ))
+                        .toList(),
+                    onChanged: (v) => setState(() => _account = v),
+                  ),
+                SizedBox(height: context.r(16)),
+                Text(l.approveScanPrompt),
+                SizedBox(height: context.r(8)),
+                if (_canScan)
+                  OutlinedButton.icon(
+                    onPressed: _scan,
+                    icon: const Icon(Icons.qr_code_scanner),
+                    label: Text(l.approveTitle),
+                  ),
+                SizedBox(height: context.r(8)),
+                TextField(
+                  controller: _link,
+                  decoration: InputDecoration(
+                    labelText: l.approvePastePrompt,
+                    border: const OutlineInputBorder(),
+                  ),
+                ),
+                SizedBox(height: context.r(16)),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed:
+                            _busy || accounts.isEmpty ? null : () => _respond(false),
+                        child: Text(l.approveReject),
+                      ),
+                    ),
+                    SizedBox(width: context.r(8)),
+                    Expanded(
+                      child: FilledButton(
+                        onPressed:
+                            _busy || accounts.isEmpty ? null : () => _respond(true),
+                        child: Text(l.approveButton),
+                      ),
+                    ),
+                  ],
+                ),
+                if (_message != null) ...[
+                  SizedBox(height: context.r(16)),
+                  Text(_message!, textAlign: TextAlign.center),
+                ],
+              ],
+            ),
+            ),
+          ),
+        ),
+        ),
+      ),
     );
   }
+}
 
-  /// Approves (or rejects) a scanned login challenge using [account]'s session.
-  Future<bool> respond(
-    SteamGuardAccount account,
-    QrChallenge challenge, {
-    required bool approve,
-  }) =>
-      respondToSession(account,
-          version: challenge.version,
-          clientId: challenge.clientId,
-          approve: approve);
+class _ScannerPage extends StatefulWidget {
+  const _ScannerPage();
 
-  /// Approves/denies a specific auth session (by client id + version). Signs the
-  /// (version, client_id, steamid) tuple with the account's shared secret
-  /// (HMAC-SHA256) and calls UpdateAuthSessionWithMobileConfirmation.
-  Future<bool> respondToSession(
-    SteamGuardAccount account, {
-    required int version,
-    required int clientId,
-    required bool approve,
-  }) async {
-    final accessToken = requireAccessToken(account);
-    final signature = _signature(account,
-        version: version, clientId: clientId, steamId: account.steamId);
+  @override
+  State<_ScannerPage> createState() => _ScannerPageState();
+}
 
-    final req = ProtoWriter()
-      ..writeVarint(1, version) // version (int32)
-      ..writeUint64(2, clientId) // client_id (uint64 varint)
-      ..writeFixed64(3, account.steamId) // steamid (fixed64!)
-      ..writeBytes(4, signature) // signature
-      ..writeBool(5, approve) // confirm
-      ..writeVarint(6, 1); // persistence = Persistent
+class _ScannerPageState extends State<_ScannerPage> {
+  // MobileScanner keeps re-detecting the same code every frame while the pop
+  // animation plays; without this latch each extra detection pops another
+  // route *below* the scanner, leaving a blank Navigator.
+  bool _done = false;
+  bool _picking = false;
+  final MobileScannerController _controller = MobileScannerController();
 
-    final fields = (await api.callProtobuf(
-      'IAuthenticationService',
-      'UpdateAuthSessionWithMobileConfirmation',
-      request: req,
-      accessToken: accessToken,
-    ))
-        .parse();
-    // Empty success response (eresult OK) means accepted.
-    return fields.isEmpty || (fields[1]?.asBool ?? true);
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
   }
 
-  /// HMAC-SHA256 over the little-endian (version|client_id|steamid) tuple,
-  /// keyed with the account's base64 shared secret. This is the signature Steam
-  /// expects for UpdateAuthSessionWithMobileConfirmation.
-  Uint8List _signature(
-    SteamGuardAccount account, {
-    required int version,
-    required int clientId,
-    required int steamId,
-  }) {
-    final key = base64.decode((account.sharedSecret ?? '').trim());
-    final buf = BytesBuilder();
-    buf.add(_le16(version));
-    buf.add(_le64(clientId));
-    buf.add(_le64(steamId));
-    return Uint8List.fromList(Hmac(sha256, key).convert(buf.toBytes()).bytes);
+  String? _firstCode(BarcodeCapture? capture) {
+    if (capture == null) return null;
+    return capture.barcodes
+        .map((b) => b.rawValue)
+        .firstWhere((v) => v != null && v.isNotEmpty, orElse: () => null);
   }
 
-  List<int> _le16(int v) => [v & 0xFF, (v >> 8) & 0xFF];
-
-  List<int> _le64(int v) {
-    final out = List<int>.filled(8, 0);
-    var x = v;
-    for (var i = 0; i < 8; i++) {
-      out[i] = x & 0xFF;
-      x >>= 8;
+  /// Bottom-right button: pick a screenshot/photo that contains the login QR
+  /// and decode it with the same scanner stack — for devices where the code
+  /// arrives as an image (chat app, second phone) instead of a live screen.
+  Future<void> _pickFromGallery() async {
+    if (_picking || _done) return;
+    final l = AppLocalizations.of(context);
+    setState(() => _picking = true);
+    try {
+      final XFile? file = await openFile(acceptedTypeGroups: const [
+        XTypeGroup(label: 'Images', mimeTypes: ['image/*']),
+      ]);
+      if (file == null) return; // cancelled
+      final capture = await _controller.analyzeImage(file.path);
+      if (!mounted || _done) return;
+      final code = _firstCode(capture);
+      if (code == null) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(l.approveNoQrInImage)));
+        return;
+      }
+      _done = true;
+      Navigator.of(context).pop(code);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(l.approveNoQrInImage)));
+      }
+    } finally {
+      if (mounted) setState(() => _picking = false);
     }
-    return out;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      // "Sign in with QR" — the user came here to scan; "approve" only makes
+      // sense on the confirm step that follows.
+      appBar: AppBar(title: Text(AppLocalizations.of(context).loginViaQr)),
+      body: MobileScanner(
+        controller: _controller,
+        onDetect: (capture) {
+          if (_done) return;
+          final code = _firstCode(capture);
+          if (code == null) return;
+          _done = true;
+          Navigator.of(context).pop(code);
+        },
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _picking ? null : _pickFromGallery,
+        tooltip: AppLocalizations.of(context).approvePickImage,
+        child: _picking
+            ? const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.photo_library),
+      ),
+    );
   }
 }
