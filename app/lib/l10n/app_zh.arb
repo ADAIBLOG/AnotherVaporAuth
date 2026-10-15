@@ -54,6 +54,7 @@
   "accountsEmpty": "暂无账户。导入 maFile 或登录以添加。",
   "emptyAddAccount": "添加账户",
   "accountReady": "已就绪",
+  "accountRevocationCode": "撤销码：{code}",
   "tutCodeTitle": "实时令牌",
   "tutCodeBody": "点击大号令牌即可复制;点击账户名可在用户名 / 昵称 / SteamID 间切换。",
   "tutSwipeRightTitle": "右滑 → 交易确认",
